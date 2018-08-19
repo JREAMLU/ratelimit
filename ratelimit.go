@@ -44,10 +44,10 @@ import (
 //
 // 桶
 //
-// 每个fillInterval间隔的tick(刻度/周期) 会有令牌添加到桶里
+// 每个fillInterval间隔的tick(刻度/周期/标记位) 会有令牌添加到桶里
 //
 // 当调用任何方法时, 存储桶会更新存储桶中的令牌数, 并且它也会记录当前的刻度数.
-// 请注意, 它不记录当前时间 - 通过以整个刻度为单位保持事物, 从开始时间开始测量, 很容易以恰当的间隔标出令牌。
+// 请注意, 它不记录当前时间 - 通过以整个刻度为单位保持事物, 从开始时间测量, 很容易以恰当的间隔标出令牌。
 //
 // 这允许我们通过一些简单的算术运算来计算将来某个时间可用的令牌数
 //
@@ -65,23 +65,25 @@ type Bucket struct {
 	// startTime holds the moment when the bucket was
 	// first created and ticks began.
 	//
-	// startTime保存了第一次创建桶并开始计时的时刻。
+	// startTime保存了第一次创建桶并开始计时的时间.
 	startTime time.Time
 
 	// capacity holds the overall capacity of the bucket.
 	//
-	// 桶的总容量
+	// capacity 桶的总容量
 	capacity int64
 
 	// quantum holds how many tokens are added on
 	// each tick.
 	//
 	// quantum 每个tick上添加多少个令牌
+	// tick 根据fillInterval来计算, 当quantum=1时 tick基本就是令牌数量
+	// availableTokens += (tick - latestTick) * quantum
 	quantum int64
 
 	// fillInterval holds the interval between each tick.
 	//
-	// fillInterval 保存每个tick之间的间隔
+	// fillInterval 每个tick之间的间隔
 	fillInterval time.Duration
 
 	// mu guards the fields below it.
@@ -133,8 +135,10 @@ const rateMargin = 0.01
 // at high rates, the actual rate may be up to 1% different from the
 // specified rate.
 //
-// NewBucketWithRate返回一个令牌桶, 它以每秒速率令牌的速率填充桶, 直到达到给定的最大容量.
+// NewBucketWithRate返回一个令牌桶, 它以每秒速率(令牌的速率)填充桶, 直到给定的最大容量.
 // 由于时钟分辨率有限, 在高速率下, 实际速率可能与指定速率不同, 最高可达1％不同
+// rate 2000 每秒2000个令牌
+// capacity 10000 总共10000个令牌
 func NewBucketWithRate(rate float64, capacity int64) *Bucket {
 	return NewBucketWithRateAndClock(rate, capacity, nil)
 }
@@ -146,7 +150,11 @@ func NewBucketWithRate(rate float64, capacity int64) *Bucket {
 func NewBucketWithRateAndClock(rate float64, capacity int64, clock Clock) *Bucket {
 	// Use the same bucket each time through the loop
 	// to save allocations.
+	// 每次循环使用相同的桶来保存分配
 	tb := NewBucketWithQuantumAndClock(1, capacity, 1, clock)
+	// quantum 2的50次方 1125899906842624
+	// 公式: fillInterval = 1e9 * quantum / rate
+	// rate = 1e9 * quantum / fillInterval
 	for quantum := int64(1); quantum < 1<<50; quantum = nextQuantum(quantum) {
 		fillInterval := time.Duration(1e9 * float64(quantum) / rate)
 		if fillInterval <= 0 {
@@ -154,6 +162,8 @@ func NewBucketWithRateAndClock(rate float64, capacity int64, clock Clock) *Bucke
 		}
 		tb.fillInterval = fillInterval
 		tb.quantum = quantum
+		// 反向计算rate时 不是整数 rate会有小数点, 通过对比rateMargin误差率 让生成令牌数更准确
+		// 主要调整 fillInterval quantum 来计算每多久来生成一个可用令牌
 		if diff := math.Abs(tb.Rate() - rate); diff/rate <= rateMargin {
 			return tb
 		}
@@ -166,6 +176,7 @@ func NewBucketWithRateAndClock(rate float64, capacity int64, clock Clock) *Bucke
 // get a good fit in the lower numbers.
 //
 // nextQuantum返回下一个量子以在q之后尝试。 我们以指数方式增长量子, 但速度很慢, 所以我们在较低的数字中得到了很好的拟合
+// 类似+n n线性增长
 func nextQuantum(q int64) int64 {
 	q1 := q * 11 / 10
 	if q1 == q {
@@ -249,9 +260,11 @@ const infinityDuration time.Duration = 0x7fffffffffffffff
 //
 // 从桶中取出计数令牌而不会阻塞. 它返回调用者应该等到令牌实际可用的时间.
 // 请注意, 如果请求是不可撤销的 - 一旦调用了此方法, 就无法将令牌返回到存储桶.
+// maxWait = infinityDuration
 func (tb *Bucket) Take(count int64) time.Duration {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
+	// 因为maxWait = infinityDuration, 触发不到返回false的逻辑, 所以返回的第二个参数没必要
 	d, _ := tb.take(tb.clock.Now(), count, infinityDuration)
 	return d
 }
@@ -279,6 +292,8 @@ func (tb *Bucket) TakeMaxDuration(count int64, maxWait time.Duration) (time.Dura
 // no available tokens. It does not block.
 //
 // TakeAvailable需要从桶中计算立即可用的令牌. 它返回已删除的令牌数, 如果没有可用令牌, 则返回零. 无阻塞
+// call前调用这个方法 返回0时已限流
+// count 需要花费的令牌数 一般为1
 func (tb *Bucket) TakeAvailable(count int64) int64 {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -293,14 +308,19 @@ func (tb *Bucket) takeAvailable(now time.Time, count int64) int64 {
 	if count <= 0 {
 		return 0
 	}
+	// 增加可用令牌数, 例如在1s内 请求过多, 令牌增加有限
 	tb.adjustavailableTokens(tb.currentTick(now))
 	if tb.availableTokens <= 0 {
 		return 0
 	}
+	// 当可用的为0时, count=0
 	if count > tb.availableTokens {
 		count = tb.availableTokens
 	}
+	// 减少可用令牌数
+	// 可用的减去花费的
 	tb.availableTokens -= count
+	// 返回已删除的令牌, 0时表明无令牌可用
 	return count
 }
 
@@ -348,6 +368,7 @@ func (tb *Bucket) take(now time.Time, count int64, maxWait time.Duration) (time.
 	tick := tb.currentTick(now)
 	tb.adjustavailableTokens(tick)
 	avail := tb.availableTokens - count
+	// 有可用令牌 返回0 一般sleep(0)
 	if avail >= 0 {
 		tb.availableTokens = avail
 		return 0, true
@@ -355,16 +376,18 @@ func (tb *Bucket) take(now time.Time, count int64, maxWait time.Duration) (time.
 	// Round up the missing tokens to the nearest multiple
 	// of quantum - the tokens won't be available until
 	// that tick.
-
+	//
 	// endTick holds the tick when all the requested tokens will
 	// become available.
 	endTick := tick + (-avail+tb.quantum-1)/tb.quantum
 	endTime := tb.startTime.Add(time.Duration(endTick) * tb.fillInterval)
 	waitTime := endTime.Sub(now)
+	// Take时 maxWait为无穷大
 	if waitTime > maxWait {
 		return 0, false
 	}
 	tb.availableTokens = avail
+	// 返回等待时间 sleep(waitTime)
 	return waitTime, true
 }
 
@@ -382,9 +405,11 @@ func (tb *Bucket) currentTick(now time.Time) int64 {
 //
 // 调整在给定时间桶中当前可用的令牌数量, tb.latestTick 正的
 func (tb *Bucket) adjustavailableTokens(tick int64) {
+	// cap为10时 初始availableTokens为11, 初始总会生成一个
 	if tb.availableTokens >= tb.capacity {
 		return
 	}
+	// quantum一般为1
 	tb.availableTokens += (tick - tb.latestTick) * tb.quantum
 	if tb.availableTokens > tb.capacity {
 		tb.availableTokens = tb.capacity
